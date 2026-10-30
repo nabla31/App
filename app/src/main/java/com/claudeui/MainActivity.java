@@ -16,6 +16,12 @@ import android.webkit.WebChromeClient;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
+import android.net.Uri;
+import android.view.Gravity;
+import android.view.View;
+import android.widget.Button;
+import android.widget.FrameLayout;
+import android.widget.LinearLayout;
 import android.widget.Toast;
 
 import java.io.ByteArrayOutputStream;
@@ -39,7 +45,8 @@ public class MainActivity extends Activity {
         + "fi\n"
         + "true\n";
 
-    private WebView web;
+    private WebView web, dash;
+    private Button tabChat, tabDash;
     private final Handler ui = new Handler(Looper.getMainLooper());
     private volatile boolean connected = false;
     private volatile boolean running = true;
@@ -50,14 +57,54 @@ public class MainActivity extends Activity {
         getWindow().setStatusBarColor(Color.parseColor("#0f0f12"));
         getWindow().setNavigationBarColor(Color.parseColor("#0f0f12"));
         web = new WebView(this);
-        web.setBackgroundColor(Color.parseColor("#0f0f12"));
-        setContentView(web);
+        web.setBackgroundColor(Color.parseColor("#262624"));
         WebSettings s = web.getSettings();
         s.setJavaScriptEnabled(true);
         s.setDomStorageEnabled(true);
         web.setWebViewClient(new WebViewClient());
         web.setWebChromeClient(new WebChromeClient());
         web.addJavascriptInterface(new Bridge(), "Android");
+
+        dash = new WebView(this);
+        dash.setBackgroundColor(Color.parseColor("#262624"));
+        WebSettings d = dash.getSettings();
+        d.setJavaScriptEnabled(true);
+        d.setDomStorageEnabled(true);
+        dash.setWebChromeClient(new WebChromeClient());
+        dash.setWebViewClient(new WebViewClient() {
+            @Override public boolean shouldOverrideUrlLoading(WebView v, android.webkit.WebResourceRequest r) {
+                String h = r.getUrl().getHost();
+                if ("localhost".equals(h) || "127.0.0.1".equals(h)) return false;
+                startActivity(new Intent(Intent.ACTION_VIEW, r.getUrl()));
+                return true;
+            }
+            @Override public void onReceivedError(WebView v, android.webkit.WebResourceRequest r, android.webkit.WebResourceError e) {
+                if (r.isForMainFrame())
+                    v.loadData("<body style='background:#262624;color:#faf9f5;font:16px sans-serif;padding:24px'>OmniRoute ne répond pas.<br>Retourne dans Chat et touche la pastille OmniRoute pour le démarrer.</body>", "text/html", "utf-8");
+            }
+        });
+        dash.setVisibility(View.GONE);
+
+        FrameLayout frame = new FrameLayout(this);
+        frame.addView(web, new FrameLayout.LayoutParams(-1, -1));
+        frame.addView(dash, new FrameLayout.LayoutParams(-1, -1));
+
+        LinearLayout bar = new LinearLayout(this);
+        bar.setBackgroundColor(Color.parseColor("#1d1d1b"));
+        tabChat = tab("Chat");
+        tabDash = tab("OmniRoute");
+        tabChat.setOnClickListener(v -> showTab(false));
+        tabDash.setOnClickListener(v -> showTab(true));
+        bar.addView(tabChat, new LinearLayout.LayoutParams(0, -2, 1));
+        bar.addView(tabDash, new LinearLayout.LayoutParams(0, -2, 1));
+
+        LinearLayout root = new LinearLayout(this);
+        root.setOrientation(LinearLayout.VERTICAL);
+        root.setBackgroundColor(Color.parseColor("#262624"));
+        root.addView(frame, new LinearLayout.LayoutParams(-1, 0, 1));
+        root.addView(bar, new LinearLayout.LayoutParams(-1, -2));
+        setContentView(root);
+        showTab(false);
         web.loadUrl(LAUNCHER);
         if (!hasPerm()) askPerm();
         startPolling();
@@ -77,7 +124,29 @@ public class MainActivity extends Activity {
 
     @Override
     public void onBackPressed() {
-        if (web.canGoBack()) web.goBack(); else super.onBackPressed();
+        boolean onDash = dash.getVisibility() == View.VISIBLE;
+        WebView w = onDash ? dash : web;
+        if (w.canGoBack()) w.goBack();
+        else if (onDash) showTab(false);
+        else super.onBackPressed();
+    }
+
+    private Button tab(String t) {
+        Button b = new Button(this);
+        b.setText(t);
+        b.setAllCaps(false);
+        b.setTextSize(14);
+        b.setBackgroundColor(Color.TRANSPARENT);
+        return b;
+    }
+
+    private void showTab(boolean d) {
+        if (d && dash.getUrl() == null) dash.loadUrl("http://localhost:20128");
+        else if (d && dash.getUrl() != null && dash.getUrl().startsWith("data:")) dash.loadUrl("http://localhost:20128");
+        dash.setVisibility(d ? View.VISIBLE : View.GONE);
+        web.setVisibility(d ? View.GONE : View.VISIBLE);
+        tabChat.setTextColor(Color.parseColor(d ? "#a09f98" : "#d97757"));
+        tabDash.setTextColor(Color.parseColor(d ? "#d97757" : "#a09f98"));
     }
 
     private boolean hasPerm() {
@@ -173,6 +242,7 @@ public class MainActivity extends Activity {
                 }
             });
         }
+        @JavascriptInterface public void showDashboard() { ui.post(() -> showTab(true)); }
         @JavascriptInterface public void start() { ui.post(MainActivity.this::startServer); }
     }
 }

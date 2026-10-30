@@ -37,7 +37,18 @@ const omniUp = () => new Promise(r => {
   q.on('timeout', () => { q.destroy(); r(false); });
 });
 
-let proc = null;
+let proc = null, run = null;
+function attach(res, from) {
+  res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no' });
+  let i = from;
+  const flush = () => {
+    while (i < run.events.length) res.write('data: ' + JSON.stringify(run.events[i++]) + '\n\n');
+    if (run.done) { run.subs.delete(flush); res.end(); }
+  };
+  run.subs.add(flush);
+  res.on('close', () => run.subs.delete(flush));
+  flush();
+}
 
 http.createServer(async (req, res) => {
   const u = req.url.split('?')[0];
@@ -50,7 +61,7 @@ http.createServer(async (req, res) => {
     return json(res, 200, { name: 'Claude Code', short_name: 'Claude', start_url: '/', display: 'standalone', background_color: '#0f0f12', theme_color: '#0f0f12' });
   }
   if (u === '/api/status') {
-    return json(res, 200, { omniroute: await omniUp(), busy: !!proc, home: os.homedir(), hasKey: !!readEnv().OMNIROUTE_KEY });
+    return json(res, 200, { omniroute: await omniUp(), busy: !!proc, prompt: proc && run ? run.prompt : '', home: os.homedir(), hasKey: !!readEnv().OMNIROUTE_KEY });
   }
   if (req.method === 'POST' && u === '/api/setup') {
     const b = await readBody(req);
@@ -80,50 +91,55 @@ http.createServer(async (req, res) => {
     if (proc) proc.kill('SIGTERM');
     return json(res, 200, { ok: true });
   }
+  if (req.method === 'GET' && u === '/api/omni/models') {
+    const k = readEnv().OMNIROUTE_KEY;
+    const q = http.get(OMNI + '/v1/models', { headers: k ? { Authorization: 'Bearer ' + k } : {}, timeout: 4000 }, r => {
+      let d = ''; r.on('data', x => d += x);
+      r.on('end', () => { try { json(res, 200, { models: (JSON.parse(d).data || []).map(m => m.id).sort() }); } catch { json(res, 200, { models: [] }); } });
+    });
+    q.on('error', () => json(res, 200, { models: [] }));
+    q.on('timeout', () => { q.destroy(); });
+    return;
+  }
+  if (req.method === 'GET' && u === '/api/attach') {
+    if (!run) { res.writeHead(204); return res.end(); }
+    return attach(res, parseInt(new URL(req.url, 'http://x').searchParams.get('from') || '0', 10));
+  }
   if (req.method === 'POST' && u === '/api/chat') {
     const b = await readBody(req);
     if (proc) return json(res, 409, { error: 'Une réponse est déjà en cours.' });
-    res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no' });
-    let open = true;
-    res.on('close', () => { open = false; });
-    const send = o => { if (open) res.write('data: ' + JSON.stringify(o) + '\n\n'); };
-
-    const e = readEnv();
-    const childEnv = { ...process.env };
-    Object.keys(e).forEach(k => { if (k !== 'OMNIROUTE_KEY') childEnv[k] = e[k]; });
+    const e = readEnv(), env = { ...process.env };
+    Object.keys(e).forEach(k => { if (k !== 'OMNIROUTE_KEY') env[k] = e[k]; });
+    const m = b.model || '';
     if (b.useOmni) {
-      childEnv.ANTHROPIC_BASE_URL = OMNI;
-      if (e.OMNIROUTE_KEY) childEnv.ANTHROPIC_AUTH_TOKEN = e.OMNIROUTE_KEY;
+      Object.assign(env, { ANTHROPIC_BASE_URL: OMNI, ANTHROPIC_API_KEY: '', CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1' });
+      if (e.OMNIROUTE_KEY) env.ANTHROPIC_AUTH_TOKEN = e.OMNIROUTE_KEY;
+      if (m) ['ANTHROPIC_MODEL', 'ANTHROPIC_SMALL_FAST_MODEL', 'ANTHROPIC_DEFAULT_OPUS_MODEL', 'ANTHROPIC_DEFAULT_SONNET_MODEL', 'ANTHROPIC_DEFAULT_HAIKU_MODEL'].forEach(k => env[k] = m);
     }
     let cwd = (b.cwd || '~').replace(/^~/, os.homedir());
     if (!fs.existsSync(cwd)) cwd = os.homedir();
-
-    const args = ['-p', '--output-format', 'stream-json', '--verbose', '--include-partial-messages',
-      '--permission-mode', b.mode || 'acceptEdits'];
-    if (b.model) args.push('--model', b.model);
+    const args = ['-p', '--output-format', 'stream-json', '--verbose', '--include-partial-messages', '--permission-mode', b.mode || 'acceptEdits'];
+    if (b.mode !== 'plan') args.push('--allowedTools', 'Bash,Read,Edit,MultiEdit,Write,Glob,Grep,LS,TodoWrite,WebFetch,WebSearch,NotebookEdit');
+    if (!b.useOmni && m) args.push('--model', m);
     if (b.session) args.push('--resume', b.session);
-
-    proc = spawn('claude', args, { cwd, env: childEnv });
-    proc.on('error', err => {
-      send({ type: 'error', text: err.code === 'ENOENT' ? 'Commande "claude" introuvable dans Termux.' : err.message });
-      proc = null; send({ type: 'done', code: -1 }); res.end();
-    });
+    run = { events: [], done: false, subs: new Set(), prompt: b.prompt || '' };
+    const emit = o => { run.events.push(o); run.subs.forEach(f => f()); };
+    const finish = code => { if (run.done) return; run.done = true; proc = null; emit({ type: 'done', code }); };
+    proc = spawn('claude', args, { cwd, env });
+    proc.on('error', err => { emit({ type: 'error', text: err.code === 'ENOENT' ? 'Commande "claude" introuvable dans Termux.' : err.message }); finish(-1); });
     proc.stdin.on('error', () => {});
     proc.stdin.end(b.prompt || '');
-
     let buf = '';
     proc.stdout.on('data', d => {
-      buf += d.toString();
-      let i;
+      buf += d.toString(); let i;
       while ((i = buf.indexOf('\n')) >= 0) {
         const line = buf.slice(0, i).trim(); buf = buf.slice(i + 1);
-        if (!line) continue;
-        try { send(JSON.parse(line)); } catch {}
+        if (line) { try { emit(JSON.parse(line)); } catch {} }
       }
     });
-    proc.stderr.on('data', d => send({ type: 'stderr', text: d.toString() }));
-    proc.on('close', code => { proc = null; send({ type: 'done', code }); res.end(); });
-    return;
+    proc.stderr.on('data', d => emit({ type: 'stderr', text: d.toString() }));
+    proc.on('close', finish);
+    return attach(res, 0);
   }
   res.writeHead(404); res.end('404');
 }).listen(PORT, '127.0.0.1', () => console.log('Claude UI sur http://localhost:' + PORT));
@@ -134,199 +150,175 @@ cat > "$APP/public/index.html" <<'HTML_EOF'
 <html lang="fr"><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<meta name="theme-color" content="#0f0f12">
+<meta name="theme-color" content="#262624">
 <link rel="manifest" href="/manifest.json">
 <title>Claude Code</title>
 <style>
-:root{--bg:#0f0f12;--card:#1a1a20;--line:#2a2a33;--txt:#ececf1;--dim:#8b8b99;--acc:#d97757;--ok:#4ade80;--bad:#f87171}
+:root{--bg:#262624;--pn:#30302e;--ln:#3f3e3b;--tx:#faf9f5;--dm:#a09f98;--ac:#d97757;--ok:#7fc77f;--bad:#e5766c}
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
-html,body{height:100%;margin:0;background:var(--bg);color:var(--txt);font:16px/1.5 system-ui,-apple-system,Roboto,sans-serif}
-body{display:flex;flex-direction:column;padding-top:env(safe-area-inset-top)}
-header{display:flex;align-items:center;gap:8px;padding:10px 12px;border-bottom:1px solid var(--line)}
-header h1{font-size:17px;margin:0;flex:1;font-weight:600}
-header h1 span{color:var(--acc)}
-button{font:inherit;color:var(--txt);background:var(--card);border:1px solid var(--line);border-radius:10px;padding:7px 11px}
-button:active{opacity:.7}
-#pill{font-size:13px;display:flex;gap:6px;align-items:center}
-#pill i{width:9px;height:9px;border-radius:50%;background:var(--bad);display:inline-block}
+html,body{height:100%;margin:0;background:var(--bg);color:var(--tx);font:16px/1.6 system-ui,Roboto,sans-serif}
+body{display:flex;flex-direction:column}
+header{display:flex;align-items:center;gap:6px;padding:10px 14px}
+header h1{flex:1;margin:0;font:600 17px Georgia,serif}header h1 b{color:var(--ac);font-weight:400;margin-right:6px}
+button{font:inherit;color:var(--tx);background:none;border:1px solid var(--ln);border-radius:10px;padding:6px 10px}
+button:active{opacity:.6}
+#pill i{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--bad);margin-right:6px}
 #pill.on i{background:var(--ok)}
-#chat{flex:1;overflow-y:auto;padding:14px 12px;display:flex;flex-direction:column;gap:12px}
-.msg{max-width:92%;padding:10px 13px;border-radius:16px;word-wrap:break-word;overflow-wrap:anywhere}
-.user{align-self:flex-end;background:var(--acc);color:#fff;border-bottom-right-radius:4px;white-space:pre-wrap}
-.bot{align-self:flex-start;background:var(--card);border:1px solid var(--line);border-bottom-left-radius:4px}
-.note{align-self:center;font-size:12.5px;color:var(--dim);text-align:center}
-.note.err{color:var(--bad)}
-code{background:#0006;padding:1px 5px;border-radius:5px;font:13.5px ui-monospace,monospace}
-pre{background:#08080b;border:1px solid var(--line);border-radius:10px;padding:10px;overflow-x:auto;margin:8px 0;font:12.5px/1.45 ui-monospace,monospace}
+#chat{flex:1;overflow-y:auto;padding:6px 16px 18px;display:flex;flex-direction:column;gap:14px}
+.user{align-self:stretch;background:var(--pn);border:1px solid var(--ln);border-radius:14px;padding:10px 14px;white-space:pre-wrap;overflow-wrap:anywhere}
+.bot{overflow-wrap:anywhere}
+.note{font-size:12.5px;color:var(--dm)}.note.err{color:var(--bad)}
+code{background:#0004;padding:1px 5px;border-radius:5px;font:13.5px ui-monospace,monospace}
+pre{background:#1d1d1b;border:1px solid var(--ln);border-radius:10px;padding:10px;overflow-x:auto;margin:8px 0;font:12.5px/1.5 ui-monospace,monospace}
 pre code{background:none;padding:0}
-details.tool{align-self:stretch;background:var(--card);border:1px solid var(--line);border-radius:12px;font-size:13.5px}
-details.tool summary{padding:8px 12px;color:var(--dim);cursor:pointer;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-details.tool pre{margin:0 8px 8px;max-height:220px}
-.dots span{display:inline-block;width:6px;height:6px;margin:0 2px;background:var(--dim);border-radius:50%;animation:b 1s infinite}
-.dots span:nth-child(2){animation-delay:.15s}.dots span:nth-child(3){animation-delay:.3s}
-@keyframes b{0%,60%,100%{opacity:.3}30%{opacity:1}}
-footer{padding:8px 10px calc(8px + env(safe-area-inset-bottom));border-top:1px solid var(--line);display:flex;gap:8px;align-items:flex-end}
-textarea{flex:1;resize:none;max-height:140px;background:var(--card);color:var(--txt);border:1px solid var(--line);border-radius:14px;padding:10px 13px;font:inherit;outline:none}
-#go{background:var(--acc);border:0;border-radius:50%;width:44px;height:44px;font-size:20px;padding:0;color:#fff}
+details.tool{font-size:14px;border-left:2px solid var(--ln);padding-left:10px}
+details.tool summary{color:var(--dm);cursor:pointer;list-style:none;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+details.tool summary::-webkit-details-marker{display:none}
+details.tool summary i{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--ac);margin-right:8px}
+details.tool.done summary i{background:var(--ok)}details.tool.fail summary i{background:var(--bad)}
+details.tool summary b{color:var(--tx);margin-right:6px}
+details.tool pre{max-height:240px;margin:6px 0}
+.add{color:var(--ok)}.del{color:var(--bad)}
+.todo{font-size:14px;line-height:1.7}
+#think{color:var(--ac);font-size:14px}#think i{display:inline-block;animation:sp 2s linear infinite;font-style:normal}
+@keyframes sp{to{transform:rotate(360deg)}}
+#comp{margin:0 12px calc(10px + env(safe-area-inset-bottom));background:var(--pn);border:1px solid var(--ln);border-radius:20px;padding:10px 12px 8px}
+textarea{width:100%;resize:none;max-height:150px;background:none;color:var(--tx);border:0;outline:0;font:inherit;padding:2px}
+#bar{display:flex;gap:8px;align-items:center;margin-top:4px}
+.chip{font-size:12.5px;color:var(--dm);padding:4px 9px;border-radius:999px;max-width:48%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#go{margin-left:auto;background:var(--ac);border:0;border-radius:50%;width:38px;height:38px;padding:0;color:#fff;font-size:18px}
 #go.stop{background:var(--bad)}
 #sheet{position:fixed;inset:0;background:#000a;display:none;align-items:flex-end;z-index:5}
 #sheet.show{display:flex}
-#sheet div.in{background:var(--bg);width:100%;border-radius:18px 18px 0 0;padding:16px 16px calc(16px + env(safe-area-inset-bottom));border-top:1px solid var(--line)}
-label{display:block;font-size:13px;color:var(--dim);margin:12px 0 4px}
-input[type=text],select{width:100%;background:var(--card);color:var(--txt);border:1px solid var(--line);border-radius:10px;padding:10px;font:inherit}
+#sheet .in{background:var(--bg);width:100%;max-height:92%;overflow:auto;border-radius:18px 18px 0 0;padding:16px 16px calc(16px + env(safe-area-inset-bottom));border-top:1px solid var(--ln)}
+label{display:block;font-size:13px;color:var(--dm);margin:12px 0 4px}
+input[type=text],input[type=password]{width:100%;background:var(--pn);color:var(--tx);border:1px solid var(--ln);border-radius:10px;padding:10px;font:inherit}
 .row{display:flex;align-items:center;gap:10px;margin-top:14px}
 </style></head><body>
-<header>
-  <h1><span>●</span> Claude Code</h1>
-  <button id="pill" title="Démarrer / arrêter OmniRoute"><i></i><span>OmniRoute</span></button>
-  <button id="new" title="Nouvelle conversation">＋</button>
-  <button id="cog" title="Réglages">⚙︎</button>
-</header>
+<header><h1><b>✻</b>Claude Code</h1><button id="pill"><i></i>OmniRoute</button><button id="new">＋</button><button id="cog">⚙︎</button></header>
 <div id="chat"></div>
-<footer>
+<div id="comp">
   <textarea id="in" rows="1" placeholder="Demande quelque chose à Claude…"></textarea>
-  <button id="go">➤</button>
-</footer>
+  <div id="bar"><button class="chip" id="modeBtn"></button><button class="chip" id="modelBtn"></button><button id="go">↑</button></div>
+</div>
 <div id="sheet"><div class="in">
   <h3 id="sheetTitle" style="margin:0">Réglages</h3>
   <label>Dossier de travail</label><input type="text" id="cwd" placeholder="~/mon-projet">
-  <label>Modèle</label>
-  <select id="model"><option value="">Par défaut</option><option value="sonnet">Sonnet</option><option value="opus">Opus</option><option value="haiku">Haiku</option></select>
-  <label>Permissions</label>
-  <select id="mode">
-    <option value="acceptEdits">Éditer sans demander</option>
-    <option value="plan">Plan (lecture seule)</option>
-    <option value="bypassPermissions">Tout autoriser (attention)</option>
-  </select>
-  <label>Clé API OmniRoute</label><input type="text" id="key" placeholder="Colle ta clé (vide = inchangée)" autocomplete="off" autocapitalize="off">
-  <div class="row"><button id="getkey" style="flex:1">Ouvrir OmniRoute pour créer une clé</button></div>
-  <div class="row"><input type="checkbox" id="omni"><span>Passer par OmniRoute</span></div>
-  <div class="row"><button id="save" style="flex:1;background:var(--acc);border:0;color:#fff">Enregistrer</button></div>
+  <label>Clé API OmniRoute</label><input type="password" id="key" placeholder="Colle ta clé (vide = inchangée)" autocomplete="off">
+  <div class="row"><button id="getkey" style="flex:1">Ouvrir le dashboard OmniRoute</button></div>
+  <label>Combo / modèle OmniRoute</label><input type="text" id="model" list="models" placeholder="ex : Claudeui" autocapitalize="off">
+  <datalist id="models"></datalist>
+  <div class="row"><button id="refresh" style="flex:1">Charger mes combos</button></div>
+  <div class="row"><input type="checkbox" id="omni"><span>Passer par OmniRoute (modèles gratuits)</span></div>
+  <div class="row"><button id="save" style="flex:1;background:var(--ac);border:0">Enregistrer</button></div>
 </div></div>
 <script>
 const $=s=>document.querySelector(s);
+const MODES={acceptEdits:'⏵⏵ Accepter les modifs',plan:'◫ Mode plan',bypassPermissions:'⚠ Tout autoriser'};
 const cfg=Object.assign({cwd:'~',model:'',mode:'acceptEdits',omni:false},JSON.parse(localStorage.getItem('cfg')||'{}'));
-let session=localStorage.getItem('sid')||'',busy=false,cur=null,gotDelta=false,tools={};
+let session=localStorage.getItem('sid')||'',busy=false,cur=null,gotDelta=false,tools={},seen=0,finished=false,omniOn=false,hasKey=false,firstRun=false;
 const chat=$('#chat'),inp=$('#in'),go=$('#go');
-const esc=s=>s.replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+const save=()=>localStorage.setItem('cfg',JSON.stringify(cfg));
+const esc=s=>String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
 function md(t){return t.split('```').map((p,i)=>{
   if(i%2){const n=p.indexOf('\n');return '<pre><code>'+esc(p.slice(n+1).replace(/\n$/,''))+'</code></pre>'}
-  return esc(p).replace(/`([^`\n]+)`/g,'<code>$1</code>').replace(/\*\*([^*\n]+)\*\*/g,'<b>$1</b>').replace(/^#{1,3} (.+)$/gm,'<b>$1</b>').replace(/\n/g,'<br>')
-}).join('')}
+  return esc(p).replace(/`([^`\n]+)`/g,'<code>$1</code>').replace(/\*\*([^*\n]+)\*\*/g,'<b>$1</b>').replace(/^#{1,3} (.+)$/gm,'<b>$1</b>').replace(/\n/g,'<br>')}).join('')}
 const scroll=()=>{chat.scrollTop=chat.scrollHeight};
-function add(kind,text){
-  const d=document.createElement('div');d.className='msg '+kind;d.raw=text||'';
+function add(kind,text){const d=document.createElement('div');d.className=kind;d.raw=text||'';
   if(kind==='user')d.textContent=text;else d.innerHTML=md(d.raw);
-  d.append=t=>{d.raw+=t;d.innerHTML=md(d.raw);scroll()};
-  chat.appendChild(d);scroll();return d;
-}
+  d.append=t=>{d.raw+=t;d.innerHTML=md(d.raw);scroll()};chat.appendChild(d);scroll();return d}
 function note(t,err){const d=document.createElement('div');d.className='note'+(err?' err':'');d.textContent=t;chat.appendChild(d);scroll()}
+function think(on){let t=$('#think');if(on&&!t){t=document.createElement('div');t.id='think';t.innerHTML='<i>✻</i> Réflexion…';chat.appendChild(t);scroll()}if(!on&&t)t.remove()}
+function diff(o,n){return (o?o.split('\n').map(l=>'<span class="del">- '+esc(l)+'</span>').join('\n')+'\n':'')+n.split('\n').map(l=>'<span class="add">+ '+esc(l)+'</span>').join('\n')}
 function toolCard(b){
-  const i=b.input||{};const brief=i.command||i.file_path||i.pattern||i.path||i.url||i.description||JSON.stringify(i);
+  const i=b.input||{},brief=i.command||i.file_path||i.pattern||i.path||i.url||i.description||'';
+  if(b.name==='TodoWrite'&&Array.isArray(i.todos)){
+    const d=document.createElement('div');d.className='todo';
+    d.innerHTML=i.todos.map(t=>(t.status==='completed'?'☑ ':t.status==='in_progress'?'◐ ':'☐ ')+esc(t.content)).join('<br>');
+    chat.appendChild(d);scroll();return}
   const d=document.createElement('details');d.className='tool';
-  d.innerHTML='<summary>🔧 '+esc(b.name)+' · '+esc(String(brief).slice(0,120))+'</summary><pre></pre>';
-  d.querySelector('pre').textContent=typeof i.command==='string'?i.command:JSON.stringify(i,null,2);
-  chat.appendChild(d);tools[b.id]=d;scroll();
-}
-function typing(on){
-  let t=$('#typing');
-  if(on&&!t){t=document.createElement('div');t.id='typing';t.className='msg bot dots';t.innerHTML='<span></span><span></span><span></span>';chat.appendChild(t);scroll()}
-  if(!on&&t)t.remove();
-}
-function setBusy(b){busy=b;go.textContent=b?'■':'➤';go.classList.toggle('stop',b);if(!b)typing(false)}
+  d.innerHTML='<summary><i></i><b>'+esc(b.name)+'</b>'+esc(String(brief).slice(0,100))+'</summary><pre></pre>';
+  const p=d.querySelector('pre');
+  if(b.name==='Edit'&&i.new_string!=null)p.innerHTML=diff(i.old_string||'',i.new_string);
+  else if(b.name==='Write'&&i.content!=null)p.innerHTML=diff('',i.content.slice(0,3000));
+  else p.textContent=i.command?'$ '+i.command:JSON.stringify(i,null,2);
+  chat.appendChild(d);tools[b.id]=d;scroll()}
+function setBusy(b){busy=b;go.textContent=b?'■':'↑';go.classList.toggle('stop',b);if(!b)think(false)}
 function handle(ev){
   if(ev.type==='system'&&ev.session_id){session=ev.session_id;localStorage.setItem('sid',session)}
-  else if(ev.type==='stream_event'){
-    const e=ev.event||{};
+  else if(ev.type==='stream_event'){const e=ev.event||{};
     if(e.type==='message_start'){cur=null;gotDelta=false}
-    else if(e.type==='content_block_delta'&&e.delta&&e.delta.type==='text_delta'){
-      typing(false);if(!cur)cur=add('bot','');cur.append(e.delta.text);gotDelta=true}
-  }
-  else if(ev.type==='assistant'){
-    typing(false);
-    for(const b of (ev.message&&ev.message.content)||[]){
+    else if(e.type==='content_block_delta'&&e.delta&&e.delta.type==='text_delta'){think(false);if(!cur)cur=add('bot','');cur.append(e.delta.text);gotDelta=true}}
+  else if(ev.type==='assistant'){think(false);
+    for(const b of(ev.message&&ev.message.content)||[]){
       if(b.type==='text'&&!gotDelta&&b.text.trim())add('bot',b.text);
-      if(b.type==='tool_use')toolCard(b);
-    }
-    cur=null;gotDelta=false;
-  }
+      if(b.type==='tool_use')toolCard(b)}
+    cur=null;gotDelta=false;if(busy)think(true)}
   else if(ev.type==='user'){
-    for(const b of (ev.message&&ev.message.content)||[]){
+    for(const b of(ev.message&&ev.message.content)||[]){
       if(b.type==='tool_result'&&tools[b.tool_use_id]){
         let c=b.content;if(Array.isArray(c))c=c.map(x=>x.text||'').join('\n');
-        const p=tools[b.tool_use_id].querySelector('pre');
-        p.textContent+='\n\n→ '+String(c||'').slice(0,4000);
-      }
-    }
-  }
+        const d=tools[b.tool_use_id];d.classList.add(b.is_error?'fail':'done');
+        const p=d.querySelector('pre');if(!/<span/.test(p.innerHTML))p.textContent+='\n\n'+String(c||'').slice(0,4000)}}}
   else if(ev.type==='result'){
     if(ev.session_id){session=ev.session_id;localStorage.setItem('sid',session)}
-    if(ev.is_error)note('Erreur : '+(ev.result||'inconnue'),true);
+    if(ev.is_error){note('Erreur : '+(ev.result||'inconnue'),true);if(/session|conversation/i.test(ev.result||'')){session='';localStorage.removeItem('sid')}}
     const s=[];if(ev.duration_ms)s.push((ev.duration_ms/1000).toFixed(1)+'s');
-    if(ev.total_cost_usd)s.push('$'+ev.total_cost_usd.toFixed(4));
-    if(s.length)note(s.join(' · '));
-  }
+    if(ev.total_cost_usd&&!cfg.omni)s.push('$'+ev.total_cost_usd.toFixed(4));if(s.length)note(s.join(' · '))}
   else if(ev.type==='stderr'&&ev.text.trim())note(ev.text.trim().slice(0,300),true);
   else if(ev.type==='error')note(ev.text,true);
-}
+  else if(ev.type==='done')finished=true}
+async function consume(r){const rd=r.body.getReader(),dec=new TextDecoder();let buf='';
+  for(;;){const{done,value}=await rd.read();if(done)return;buf+=dec.decode(value,{stream:true});let i;
+    while((i=buf.indexOf('\n\n'))>=0){const c=buf.slice(0,i);buf=buf.slice(i+2);
+      if(c.startsWith('data: ')){seen++;try{handle(JSON.parse(c.slice(6)))}catch(e){}}}}}
+async function follow(r){
+  setBusy(true);think(true);seen=0;finished=false;
+  while(!finished){
+    try{if(!r){r=await fetch('/api/attach?from='+seen);if(r.status===204)break}await consume(r)}catch(e){}
+    r=null;if(!finished)await new Promise(x=>setTimeout(x,1000))}
+  setBusy(false)}
 async function sendMsg(){
   if(busy){fetch('/api/stop',{method:'POST'});return}
   const prompt=inp.value.trim();if(!prompt)return;
-  inp.value='';fit();add('user',prompt);setBusy(true);typing(true);cur=null;gotDelta=false;
-  try{
-    const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({prompt,session,cwd:cfg.cwd,model:cfg.model,mode:cfg.mode,useOmni:cfg.omni})});
+  inp.value='';fit();add('user',prompt);cur=null;gotDelta=false;
+  try{const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({prompt,session,cwd:cfg.cwd,model:cfg.model,mode:cfg.mode,useOmni:cfg.omni})});
     if(!r.ok){const j=await r.json().catch(()=>({}));throw new Error(j.error||r.status)}
-    const rd=r.body.getReader(),dec=new TextDecoder();let buf='';
-    for(;;){
-      const {done,value}=await rd.read();if(done)break;
-      buf+=dec.decode(value,{stream:true});let i;
-      while((i=buf.indexOf('\n\n'))>=0){
-        const c=buf.slice(0,i);buf=buf.slice(i+2);
-        if(c.startsWith('data: ')){try{handle(JSON.parse(c.slice(6)))}catch(e){}}
-      }
-    }
-  }catch(e){note('Connexion perdue : '+e.message,true)}
-  setBusy(false);
-}
-function fit(){inp.style.height='auto';inp.style.height=Math.min(inp.scrollHeight,140)+'px'}
-inp.addEventListener('input',fit);
-inp.addEventListener('keydown',e=>{if(e.key==='Enter'&&(e.ctrlKey||e.metaKey)){e.preventDefault();sendMsg()}});
-go.onclick=sendMsg;
+    await follow(r)}catch(e){note('Erreur : '+e.message,true);setBusy(false)}}
+function fit(){inp.style.height='auto';inp.style.height=Math.min(inp.scrollHeight,150)+'px'}
+function chips(){$('#modeBtn').textContent=MODES[cfg.mode];$('#modelBtn').textContent=(cfg.omni?'⇄ ':'')+(cfg.model||'modèle par défaut')}
+inp.addEventListener('input',fit);go.onclick=sendMsg;
+$('#modeBtn').onclick=()=>{const k=Object.keys(MODES);cfg.mode=k[(k.indexOf(cfg.mode)+1)%k.length];save();chips()};
+$('#modelBtn').onclick=()=>openSheet(false);
 $('#new').onclick=()=>{if(busy)return;session='';localStorage.removeItem('sid');chat.innerHTML='';tools={};note('Nouvelle conversation')};
-let firstRun=false;
-function openSheet(first){
-  firstRun=!!first;$('#sheetTitle').textContent=first?'Configuration initiale':'Réglages';
-  $('#cwd').value=cfg.cwd;$('#model').value=cfg.model;$('#mode').value=cfg.mode;$('#omni').checked=first?true:cfg.omni;$('#key').value='';
-  $('#sheet').classList.add('show');
-}
+function openSheet(first){firstRun=!!first;$('#sheetTitle').textContent=first?'Configuration initiale':'Réglages';
+  $('#cwd').value=cfg.cwd;$('#model').value=cfg.model;$('#omni').checked=first?true:cfg.omni;$('#key').value='';$('#sheet').classList.add('show')}
 $('#cog').onclick=()=>openSheet(false);
 $('#sheet').onclick=e=>{if(e.target.id==='sheet'&&!firstRun)$('#sheet').classList.remove('show')};
-$('#save').onclick=async()=>{
-  const key=$('#key').value.trim();
-  if(key){try{await fetch('/api/setup',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key})})}catch{}}
-  Object.assign(cfg,{cwd:$('#cwd').value.trim()||'~',model:$('#model').value,mode:$('#mode').value,omni:$('#omni').checked&&(!!key||!firstRun||hasKey)});
-  localStorage.setItem('cfg',JSON.stringify(cfg));localStorage.setItem('setupDone','1');
-  firstRun=false;$('#sheet').classList.remove('show');
-};
-$('#getkey').onclick=async()=>{
-  note('Démarrage d’OmniRoute… patiente quelques secondes');$('#sheet').classList.remove('show');
-  await fetch('/api/omniroute/start',{method:'POST'});
-  for(let i=0;i<30;i++){await poll();if(omniOn)break;await new Promise(r=>setTimeout(r,2000))}
-  if(omniOn)location.href='http://localhost:20128';else note('OmniRoute ne répond pas (voir omniroute.log).',true);
-};
-let omniOn=false,hasKey=false;
-async function poll(){
-  try{const s=await (await fetch('/api/status')).json();omniOn=s.omniroute;hasKey=s.hasKey;$('#pill').classList.toggle('on',omniOn)}catch{}
-}
-$('#pill').onclick=async()=>{
-  note(omniOn?'Arrêt d’OmniRoute…':'Démarrage d’OmniRoute… (patiente quelques secondes)');
-  await fetch('/api/omniroute/'+(omniOn?'stop':'start'),{method:'POST'});
-  for(let i=0;i<12;i++){await new Promise(r=>setTimeout(r,2000));await poll()}
-};
-poll();setInterval(poll,5000);
-if(!localStorage.getItem('setupDone'))openSheet(true);
-note('Prêt. Dossier : '+cfg.cwd+(session?' · conversation reprise':''));
+$('#refresh').onclick=async()=>{
+  const key=$('#key').value.trim();if(key)await fetch('/api/setup',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key})});
+  const m=(await(await fetch('/api/omni/models')).json()).models||[];
+  $('#models').innerHTML=m.map(x=>'<option value="'+esc(x)+'">').join('');
+  const g=m.find(x=>/claudeui/i.test(x));if(g&&!$('#model').value)$('#model').value=g;
+  note(m.length?m.length+' modèles/combos chargés — tape dans le champ pour choisir':'Aucun modèle : vérifie la clé et qu’OmniRoute tourne',!m.length)};
+$('#save').onclick=async()=>{const key=$('#key').value.trim();
+  if(key)try{await fetch('/api/setup',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key})});hasKey=true}catch{}
+  Object.assign(cfg,{cwd:$('#cwd').value.trim()||'~',model:$('#model').value.trim(),omni:$('#omni').checked&&(hasKey||!firstRun)});
+  save();localStorage.setItem('setupDone','1');firstRun=false;$('#sheet').classList.remove('show');chips()};
+async function openDash(){
+  $('#sheet').classList.remove('show');
+  if(!omniOn){note('Démarrage d’OmniRoute…');await fetch('/api/omniroute/start',{method:'POST'});
+    for(let i=0;i<30&&!omniOn;i++){await new Promise(r=>setTimeout(r,2000));await poll()}}
+  if(!omniOn)return note('OmniRoute ne répond pas (voir ~/claude-ui/omniroute.log).',true);
+  if(window.Android&&Android.showDashboard)Android.showDashboard();else location.href='http://localhost:20128'}
+$('#getkey').onclick=openDash;$('#pill').onclick=openDash;
+async function poll(){try{const s=await(await fetch('/api/status')).json();omniOn=s.omniroute;hasKey=s.hasKey;$('#pill').classList.toggle('on',omniOn)}catch{}}
+(async()=>{await poll();
+  if(!localStorage.getItem('setupDone'))openSheet(true);
+  note('Dossier : '+cfg.cwd+(session?' · conversation reprise':''));chips();
+  try{const s=await(await fetch('/api/status')).json();if(s.busy){add('user',s.prompt||'…');follow(null)}}catch{}
+  setInterval(poll,5000)})();
 </script></body></html>
 HTML_EOF
 
