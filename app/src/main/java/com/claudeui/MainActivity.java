@@ -37,13 +37,10 @@ public class MainActivity extends Activity {
     static final String APP_URL = "http://localhost:8787";
     static final String LAUNCHER = "file:///android_asset/launcher.html";
     static final String START_CMD =
-        "if [ -f ~/claude-ui/server.js ] && ! pgrep -f 'node serve[r].js' >/dev/null; then\n"
-        + "  termux-wake-lock\n"
-        + "  cd ~/claude-ui\n"
-        + "  command -v setsid >/dev/null && S=setsid || S=\n"
-        + "  $S nohup node server.js > server.log 2>&1 < /dev/null &\n"
-        + "fi\n"
-        + "true\n";
+        "pgrep -f 'node serve[r].js' >/dev/null && exit 0\n"
+        + "[ -f ~/claude-ui/server.js ] || exit 1\n"
+        + "termux-wake-lock\n"
+        + "cd ~/claude-ui && exec node server.js\n";
 
     private WebView web, dash;
     private Button tabChat, tabDash;
@@ -161,7 +158,7 @@ public class MainActivity extends Activity {
         Toast.makeText(this, t, Toast.LENGTH_LONG).show();
     }
 
-    private void runTermux(String path, String[] args, boolean background) {
+    private void runTermux(String path, String[] args, boolean background, String action) {
         try {
             Intent i = new Intent("com.termux.RUN_COMMAND");
             i.setClassName("com.termux", "com.termux.app.RunCommandService");
@@ -169,6 +166,7 @@ public class MainActivity extends Activity {
             i.putExtra("com.termux.RUN_COMMAND_ARGUMENTS", args);
             i.putExtra("com.termux.RUN_COMMAND_WORKDIR", HOME);
             i.putExtra("com.termux.RUN_COMMAND_BACKGROUND", background);
+            if (action != null) i.putExtra("com.termux.RUN_COMMAND_SESSION_ACTION", action);
             if (Build.VERSION.SDK_INT >= 26) startForegroundService(i); else startService(i);
         } catch (Exception e) {
             toast("Termux : " + e.getMessage());
@@ -176,7 +174,7 @@ public class MainActivity extends Activity {
     }
 
     private void startServer() {
-        runTermux(BASH, new String[]{"-c", START_CMD}, true);
+        runTermux(BASH, new String[]{"-c", START_CMD}, false, "3");
     }
 
     private String readAsset(String name) throws Exception {
@@ -200,8 +198,11 @@ public class MainActivity extends Activity {
 
     private void startPolling() {
         new Thread(() -> {
+            int tick = 0;
             while (running) {
                 boolean up = ping();
+                if (!up && hasPerm() && tick++ % 13 == 0) ui.post(this::startServer);
+                if (up) tick = 0;
                 if (up && !connected) {
                     connected = true;
                     ui.post(() -> web.loadUrl(APP_URL));
@@ -236,7 +237,7 @@ public class MainActivity extends Activity {
         @JavascriptInterface public void install() {
             ui.post(() -> {
                 try {
-                    runTermux(BASH, new String[]{"-c", readAsset("setup.sh")}, false);
+                    runTermux(BASH, new String[]{"-c", readAsset("setup.sh")}, false, null);
                 } catch (Exception e) {
                     toast("Erreur : " + e.getMessage());
                 }
