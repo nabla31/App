@@ -19,7 +19,10 @@ import android.webkit.WebViewClient;
 import android.net.Uri;
 import android.view.Gravity;
 import android.view.View;
-import android.widget.Button;
+import android.graphics.drawable.GradientDrawable;
+import android.transition.TransitionManager;
+import android.widget.ImageView;
+import android.widget.TextView;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.Toast;
@@ -43,7 +46,12 @@ public class MainActivity extends Activity {
         + "cd ~/claude-ui && exec node server.js\n";
 
     private WebView web, dash;
-    private Button tabChat, tabDash;
+    private LinearLayout navBar, navWrap, rootView;
+    private final LinearLayout[] navItems = new LinearLayout[3];
+    private final ImageView[] navIcons = new ImageView[3];
+    private final TextView[] navLabels = new TextView[3];
+    private int sel = 0, accent = Color.parseColor("#d97757");
+    private boolean dark = true;
     private final Handler ui = new Handler(Looper.getMainLooper());
     private volatile boolean connected = false;
     private volatile boolean running = true;
@@ -51,10 +59,10 @@ public class MainActivity extends Activity {
     @Override
     protected void onCreate(Bundle b) {
         super.onCreate(b);
-        getWindow().setStatusBarColor(Color.parseColor("#0f0f12"));
-        getWindow().setNavigationBarColor(Color.parseColor("#0f0f12"));
+        getWindow().setStatusBarColor(Color.parseColor("#1b1a19"));
+        getWindow().setNavigationBarColor(Color.parseColor("#1b1a19"));
         web = new WebView(this);
-        web.setBackgroundColor(Color.parseColor("#262624"));
+        web.setBackgroundColor(Color.parseColor("#1b1a19"));
         WebSettings s = web.getSettings();
         s.setJavaScriptEnabled(true);
         s.setDomStorageEnabled(true);
@@ -63,7 +71,7 @@ public class MainActivity extends Activity {
         web.addJavascriptInterface(new Bridge(), "Android");
 
         dash = new WebView(this);
-        dash.setBackgroundColor(Color.parseColor("#262624"));
+        dash.setBackgroundColor(Color.parseColor("#1b1a19"));
         WebSettings d = dash.getSettings();
         d.setJavaScriptEnabled(true);
         d.setDomStorageEnabled(true);
@@ -77,7 +85,7 @@ public class MainActivity extends Activity {
             }
             @Override public void onReceivedError(WebView v, android.webkit.WebResourceRequest r, android.webkit.WebResourceError e) {
                 if (r.isForMainFrame())
-                    v.loadData("<body style='background:#262624;color:#faf9f5;font:16px sans-serif;padding:24px'>OmniRoute ne répond pas.<br>Retourne dans Chat et touche la pastille OmniRoute pour le démarrer.</body>", "text/html", "utf-8");
+                    v.loadData("<body style='background:#1b1a19;color:#faf9f5;font:16px sans-serif;padding:24px'>OmniRoute ne répond pas.<br>Retourne dans Chat et touche la pastille OmniRoute pour le démarrer.</body>", "text/html", "utf-8");
             }
         });
         dash.setVisibility(View.GONE);
@@ -86,21 +94,23 @@ public class MainActivity extends Activity {
         frame.addView(web, new FrameLayout.LayoutParams(-1, -1));
         frame.addView(dash, new FrameLayout.LayoutParams(-1, -1));
 
-        LinearLayout bar = new LinearLayout(this);
-        bar.setBackgroundColor(Color.parseColor("#1d1d1b"));
-        tabChat = tab("Chat");
-        tabDash = tab("OmniRoute");
-        tabChat.setOnClickListener(v -> showTab(false));
-        tabDash.setOnClickListener(v -> showTab(true));
-        bar.addView(tabChat, new LinearLayout.LayoutParams(0, -2, 1));
-        bar.addView(tabDash, new LinearLayout.LayoutParams(0, -2, 1));
+        navBar = new LinearLayout(this);
+        navBar.setOrientation(LinearLayout.HORIZONTAL);
+        navBar.setGravity(Gravity.CENTER_VERTICAL);
+        navBar.setPadding(dp(8), dp(8), dp(8), dp(8));
+        navBar.addView(navItem(R.drawable.ic_chat, "Chat", 0));
+        navBar.addView(navItem(R.drawable.ic_dash, "OmniRoute", 1));
+        navBar.addView(navItem(R.drawable.ic_tune, "Réglages", 2));
+        navWrap = new LinearLayout(this);
+        navWrap.setPadding(dp(14), dp(8), dp(14), dp(8));
+        navWrap.addView(navBar, new LinearLayout.LayoutParams(-1, -2));
 
-        LinearLayout root = new LinearLayout(this);
-        root.setOrientation(LinearLayout.VERTICAL);
-        root.setBackgroundColor(Color.parseColor("#262624"));
-        root.addView(frame, new LinearLayout.LayoutParams(-1, 0, 1));
-        root.addView(bar, new LinearLayout.LayoutParams(-1, -2));
-        setContentView(root);
+        rootView = new LinearLayout(this);
+        rootView.setOrientation(LinearLayout.VERTICAL);
+        rootView.addView(frame, new LinearLayout.LayoutParams(-1, 0, 1));
+        rootView.addView(navWrap, new LinearLayout.LayoutParams(-1, -2));
+        setContentView(rootView);
+        styleBar();
         showTab(false);
         web.loadUrl(LAUNCHER);
         if (!hasPerm()) askPerm();
@@ -128,22 +138,85 @@ public class MainActivity extends Activity {
         else super.onBackPressed();
     }
 
-    private Button tab(String t) {
-        Button b = new Button(this);
-        b.setText(t);
-        b.setAllCaps(false);
-        b.setTextSize(14);
-        b.setBackgroundColor(Color.TRANSPARENT);
-        return b;
+    private int dp(int v) { return (int) (v * getResources().getDisplayMetrics().density); }
+
+    private LinearLayout navItem(int icon, String label, int idx) {
+        LinearLayout it = new LinearLayout(this);
+        it.setOrientation(LinearLayout.HORIZONTAL);
+        it.setGravity(Gravity.CENTER);
+        ImageView iv = new ImageView(this);
+        iv.setImageResource(icon);
+        TextView tv = new TextView(this);
+        tv.setText(label);
+        tv.setTextSize(14);
+        tv.setSingleLine(true);
+        tv.setTypeface(null, android.graphics.Typeface.BOLD);
+        tv.setPadding(dp(8), 0, 0, 0);
+        it.addView(iv, new LinearLayout.LayoutParams(dp(24), dp(24)));
+        it.addView(tv);
+        it.setOnClickListener(v -> select(idx));
+        navItems[idx] = it; navIcons[idx] = iv; navLabels[idx] = tv;
+        return it;
+    }
+
+    private void select(int i) {
+        if (i == 2) {
+            setTab(false);
+            web.evaluateJavascript("location.hash='settings'", null);
+        } else {
+            web.evaluateJavascript("if(location.hash==='#settings')history.back()", null);
+            showTab(i == 1);
+        }
+        paintNav(i);
     }
 
     private void showTab(boolean d) {
-        if (d && dash.getUrl() == null) dash.loadUrl("http://localhost:20128");
-        else if (d && dash.getUrl() != null && dash.getUrl().startsWith("data:")) dash.loadUrl("http://localhost:20128");
+        if (d && (dash.getUrl() == null || dash.getUrl().startsWith("data:"))) dash.loadUrl("http://localhost:20128");
+        setTab(d);
+        paintNav(d ? 1 : (sel == 2 ? 2 : 0));
+    }
+
+    private void setTab(boolean d) {
         dash.setVisibility(d ? View.VISIBLE : View.GONE);
         web.setVisibility(d ? View.GONE : View.VISIBLE);
-        tabChat.setTextColor(Color.parseColor(d ? "#a09f98" : "#d97757"));
-        tabDash.setTextColor(Color.parseColor(d ? "#d97757" : "#a09f98"));
+    }
+
+    private void styleBar() {
+        GradientDrawable g = new GradientDrawable();
+        g.setCornerRadius(dp(34));
+        g.setColor(Color.parseColor(dark ? "#2b2a28" : "#ebe5dc"));
+        navBar.setBackground(g);
+        int bg = Color.parseColor(dark ? "#1b1a19" : "#fbf8f3");
+        rootView.setBackgroundColor(bg);
+        navWrap.setBackgroundColor(bg);
+        getWindow().setStatusBarColor(bg);
+        getWindow().setNavigationBarColor(bg);
+        int flags = 0;
+        if (!dark) {
+            flags = View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR;
+            if (Build.VERSION.SDK_INT >= 26) flags |= View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR;
+        }
+        getWindow().getDecorView().setSystemUiVisibility(flags);
+        paintNav(sel);
+    }
+
+    private void paintNav(int i) {
+        sel = i;
+        TransitionManager.beginDelayedTransition(navBar);
+        int on = Color.parseColor(dark ? "#f0ede8" : "#1e1b17"), off = Color.parseColor(dark ? "#b3ada5" : "#5f584f");
+        for (int k = 0; k < 3; k++) {
+            boolean s = k == i;
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, dp(56), s ? 2.3f : 1f);
+            lp.setMargins(dp(2), 0, dp(2), 0);
+            navItems[k].setLayoutParams(lp);
+            navLabels[k].setVisibility(s ? View.VISIBLE : View.GONE);
+            navLabels[k].setTextColor(on);
+            navIcons[k].setColorFilter(s ? on : off);
+            GradientDrawable g = new GradientDrawable();
+            g.setCornerRadius(dp(28));
+            g.setColor(s ? ((accent & 0x00FFFFFF) | 0x66000000) : Color.TRANSPARENT);
+            navItems[k].setBackground(g);
+        }
     }
 
     private boolean hasPerm() {
@@ -241,6 +314,35 @@ public class MainActivity extends Activity {
                 } catch (Exception e) {
                     toast("Erreur : " + e.getMessage());
                 }
+            });
+        }
+        @JavascriptInterface public void showUrl(String u) {
+            ui.post(() -> {
+                try {
+                    String h = Uri.parse(u).getHost();
+                    if (!"localhost".equals(h) && !"127.0.0.1".equals(h)) return;
+                    String cur = dash.getUrl();
+                    if (cur == null || !cur.startsWith(u)) dash.loadUrl(u);
+                    setTab(true);
+                    paintNav(1);
+                } catch (Exception e) { }
+            });
+        }
+        @JavascriptInterface public String dynamicColor() {
+            if (Build.VERSION.SDK_INT < 31) return "";
+            return String.format("#%06X", 0xFFFFFF & getColor(android.R.color.system_accent1_500));
+        }
+        @JavascriptInterface public void setStyle(String hex, boolean d) {
+            ui.post(() -> {
+                try { accent = Color.parseColor(hex); } catch (Exception e) { }
+                dark = d;
+                styleBar();
+            });
+        }
+        @JavascriptInterface public void onRoute(boolean settings) {
+            ui.post(() -> {
+                if (settings) { setTab(false); paintNav(2); }
+                else if (sel == 2) paintNav(0);
             });
         }
         @JavascriptInterface public void showDashboard() { ui.post(() -> showTab(true)); }

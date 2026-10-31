@@ -30,8 +30,10 @@ code{display:block;background:#08080b;border:1px solid var(--line);border-radius
 <button onclick="Android.install()">Installer</button>
 <button class="g" onclick="Android.start()">Démarrer le serveur</button></div>
 
+<button class="g" onclick="skip()">Déjà installé ? Passer →</button>
 <p class="wait">En attente du serveur local…<br>L’écran de configuration (clé OmniRoute, dossier, modèle) s’ouvrira automatiquement.</p>
 <script>
 function t(){try{document.getElementById('s1').textContent=Android.hasPerm()?'✓':'';document.getElementById('s1').className='ok'}catch(e){}}
+function skip(){document.querySelectorAll('.step').forEach(e=>e.style.display='none');try{Android.start()}catch(e){}}
 t();setInterval(t,1000);
 </script></body></html>
