@@ -1,39 +1,51 @@
 <!doctype html><html lang="fr"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
-:root{--bg:#0f0f12;--card:#1a1a20;--line:#2a2a33;--txt:#ececf1;--dim:#8b8b99;--acc:#d97757;--ok:#4ade80}
-*{box-sizing:border-box}body{margin:0;padding:22px 16px 40px;background:var(--bg);color:var(--txt);font:16px/1.5 system-ui,Roboto,sans-serif}
-h1{font-size:22px;margin:0 0 4px}h1 span{color:var(--acc)}p.s{color:var(--dim);margin:0 0 18px}
-.step{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px;margin-bottom:12px}
-.step b{display:block;margin-bottom:6px}.step small{color:var(--dim);display:block;margin-bottom:8px}
-button{font:inherit;color:#fff;background:var(--acc);border:0;border-radius:10px;padding:10px 14px;margin:4px 6px 0 0}
-button.g{background:#2a2a33}
-code{display:block;background:#08080b;border:1px solid var(--line);border-radius:8px;padding:8px;font:12.5px ui-monospace,monospace;word-break:break-all;margin:6px 0}
-.ok{color:var(--ok)}
-.wait{text-align:center;color:var(--dim);margin-top:20px}
+:root{--bg:#1b1a19;--s1:#232220;--s3:#363432;--tx:#f0ede8;--dm:#b3ada5;--ac:#d97757;--ok:#5fb36b;--bad:#e5645a}
+*{box-sizing:border-box}body{margin:0;padding:24px 16px 40px;background:var(--bg);color:var(--tx);font:16px/1.5 system-ui,Roboto,sans-serif}
+h1{font:700 26px Georgia,serif;margin:0 0 4px}h1 b{color:var(--ac)}p.s{color:var(--dm);margin:0 0 18px}
+.step{background:var(--s1);border-radius:28px;padding:18px;margin-bottom:12px}
+.step b{display:block;margin-bottom:6px}.step small{color:var(--dm);display:block;margin-bottom:8px}
+button{font:600 14px system-ui;color:#fff;background:var(--ac);border:0;border-radius:999px;padding:12px 18px;margin:6px 8px 0 0;transition:border-radius .3s cubic-bezier(.34,1.56,.64,1)}
+button:active{border-radius:12px}button.g{background:var(--s3);color:var(--tx)}
+code{display:block;background:#0006;border-radius:14px;padding:10px;font:12.5px ui-monospace,monospace;word-break:break-all;margin:6px 0}
+#splash{display:none;text-align:center;margin-top:70px}#splash button{margin:6px 4px 0}
+.ld{width:46px;height:46px;margin:0 auto 20px;background:var(--ac);animation:mo 1.8s cubic-bezier(.34,1.56,.64,1) infinite}
+@keyframes mo{0%{border-radius:50%;transform:rotate(0)}33%{border-radius:32% 68% 68% 32%/32% 32% 68% 68%;transform:rotate(120deg)}66%{border-radius:22%;transform:rotate(240deg)}100%{border-radius:50%;transform:rotate(360deg)}}
+#err{color:var(--bad);margin:14px 0 0;font-size:14px;white-space:pre-wrap}.hint{color:var(--dm);font-size:13px;margin-top:16px;text-align:left}
 </style></head><body>
-<h1><span>●</span> Claude UI</h1>
+<h1><b>✻</b> Claude UI</h1>
+<div id="setup">
 <p class="s">Configuration au premier lancement</p>
-
-<div class="step"><b>1. Autoriser l’app <span id="s1"></span></b>
-<small>Permission pour piloter Termux.</small>
-<button onclick="Android.askPerm()">Autoriser</button></div>
-
+<div class="step" id="st1"><b>1. Autoriser l’app</b><small>Permission pour piloter Termux.</small><button onclick="Android.askPerm()">Autoriser</button></div>
 <div class="step"><b>2. Dans Termux (une seule fois)</b>
 <small>Installe Termux depuis F-Droid (pas le Play Store). Copie cette commande, ouvre Termux, colle-la, puis valide.</small>
 <code id="cmd">mkdir -p ~/.termux &amp;&amp; echo "allow-external-apps=true" &gt;&gt; ~/.termux/termux.properties &amp;&amp; termux-reload-settings</code>
 <button onclick="Android.copy(document.getElementById('cmd').innerText)">Copier</button>
 <button class="g" onclick="Android.openTermux()">Ouvrir Termux</button></div>
-
 <div class="step"><b>3. Installer Claude UI + OmniRoute</b>
 <small>Ouvre une session Termux qui installe tout (quelques minutes). Reviens ensuite dans l’app.</small>
-<button onclick="Android.install()">Installer</button>
-<button class="g" onclick="Android.start()">Démarrer le serveur</button></div>
-
+<button onclick="Android.install()">Installer</button><button class="g" onclick="Android.startMode(false)">Démarrer le serveur</button></div>
 <button class="g" onclick="skip()">Déjà installé ? Passer →</button>
-<p class="wait">En attente du serveur local…<br>L’écran de configuration (clé OmniRoute, dossier, modèle) s’ouvrira automatiquement.</p>
+</div>
+<div id="splash"><div class="ld"></div><div id="msg">Démarrage du serveur…</div><div id="err"></div>
+<div id="more" style="display:none">
+<button onclick="Android.startMode(false)">Réessayer</button><button class="g" onclick="Android.startMode(true)">Mode visible</button>
+<button class="g" onclick="again()">Revoir la configuration</button>
+<div class="hint">Si rien ne démarre : Paramètres → Apps → Termux → Économie de batterie → « Aucune restriction », et active le démarrage automatique. Le « Mode visible » ouvre Termux un instant pour lancer le serveur.</div></div></div>
 <script>
-function t(){try{document.getElementById('s1').textContent=Android.hasPerm()?'✓':'';document.getElementById('s1').className='ok'}catch(e){}}
-function skip(){document.querySelectorAll('.step').forEach(e=>e.style.display='none');try{Android.start()}catch(e){}}
-t();setInterval(t,1000);
+const t0=Date.now();let skipped=false;
+function skip(){skipped=true;try{Android.startMode(false)}catch(e){}render()}
+function again(){try{Android.resetSetup()}catch(e){}skipped=false;render()}
+function render(){let ready=false,perm=false,e='';
+  try{ready=Android.isReady();perm=Android.hasPerm();e=Android.lastError()}catch(x){}
+  const sp=ready||skipped;
+  document.getElementById('setup').style.display=sp?'none':'';
+  document.getElementById('splash').style.display=sp?'block':'none';
+  document.getElementById('st1').style.display=perm?'none':'';
+  document.getElementById('err').textContent=e?('Termux : '+e):'';
+  const late=(Date.now()-t0)>15000||!!e;
+  document.getElementById('more').style.display=late?'block':'none';
+  document.getElementById('msg').textContent=late?'Le serveur ne démarre pas encore…':'Démarrage du serveur…'}
+render();setInterval(render,1000);
 </script></body></html>

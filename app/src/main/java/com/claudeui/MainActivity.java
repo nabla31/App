@@ -1,6 +1,8 @@
 package com.claudeui;
 
 import android.app.Activity;
+import android.app.PendingIntent;
+import android.content.SharedPreferences;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
@@ -39,9 +41,14 @@ public class MainActivity extends Activity {
     static final String BASH = "/data/data/com.termux/files/usr/bin/bash";
     static final String APP_URL = "http://localhost:8787";
     static final String LAUNCHER = "file:///android_asset/launcher.html";
-    static final String START_CMD =
+    static final String START_BG =
         "pgrep -f 'node serve[r].js' >/dev/null && exit 0\n"
-        + "[ -f ~/claude-ui/server.js ] || exit 1\n"
+        + "[ -f ~/claude-ui/server.js ] || { echo \"Claude UI n'est pas installé : appuie sur Installer.\"; exit 1; }\n"
+        + "termux-wake-lock\n"
+        + "cd ~/claude-ui && exec node server.js >> server.log 2>&1\n";
+    static final String START_VIS =
+        "pgrep -f 'node serve[r].js' >/dev/null && exit 0\n"
+        + "[ -f ~/claude-ui/server.js ] || { echo \"Claude UI n'est pas installé : appuie sur Installer.\"; sleep 5; exit 1; }\n"
         + "termux-wake-lock\n"
         + "cd ~/claude-ui && exec node server.js\n";
 
@@ -52,6 +59,8 @@ public class MainActivity extends Activity {
     private final TextView[] navLabels = new TextView[3];
     private int sel = 0, accent = Color.parseColor("#d97757");
     private boolean dark = true;
+    private SharedPreferences prefs;
+    private volatile boolean lastVisible = false;
     private final Handler ui = new Handler(Looper.getMainLooper());
     private volatile boolean connected = false;
     private volatile boolean running = true;
@@ -59,6 +68,7 @@ public class MainActivity extends Activity {
     @Override
     protected void onCreate(Bundle b) {
         super.onCreate(b);
+        prefs = getSharedPreferences("cui", MODE_PRIVATE);
         getWindow().setStatusBarColor(Color.parseColor("#1b1a19"));
         getWindow().setNavigationBarColor(Color.parseColor("#1b1a19"));
         web = new WebView(this);
@@ -240,6 +250,11 @@ public class MainActivity extends Activity {
             i.putExtra("com.termux.RUN_COMMAND_WORKDIR", HOME);
             i.putExtra("com.termux.RUN_COMMAND_BACKGROUND", background);
             if (action != null) i.putExtra("com.termux.RUN_COMMAND_SESSION_ACTION", action);
+            if (background) {
+                int fl = PendingIntent.FLAG_UPDATE_CURRENT | (Build.VERSION.SDK_INT >= 31 ? PendingIntent.FLAG_MUTABLE : 0);
+                i.putExtra("com.termux.RUN_COMMAND_PENDING_INTENT",
+                    PendingIntent.getBroadcast(this, 0, new Intent(this, ResultReceiver.class), fl));
+            }
             if (Build.VERSION.SDK_INT >= 26) startForegroundService(i); else startService(i);
         } catch (Exception e) {
             toast("Termux : " + e.getMessage());
@@ -247,7 +262,14 @@ public class MainActivity extends Activity {
     }
 
     private void startServer() {
-        runTermux(BASH, new String[]{"-c", START_CMD}, false, "3");
+        startServer(prefs.getBoolean("visible", false));
+    }
+
+    private void startServer(boolean visible) {
+        lastVisible = visible;
+        ResultReceiver.last = "";
+        if (visible) runTermux(BASH, new String[]{"-c", START_VIS}, false, null);
+        else runTermux(BASH, new String[]{"-c", START_BG}, true, null);
     }
 
     private String readAsset(String name) throws Exception {
@@ -274,10 +296,19 @@ public class MainActivity extends Activity {
             int tick = 0;
             while (running) {
                 boolean up = ping();
-                if (!up && hasPerm() && tick++ % 13 == 0) ui.post(this::startServer);
+                if (!up && hasPerm()) {
+                    boolean vis = prefs.getBoolean("visible", false);
+                    if (tick == 0) ui.post(() -> startServer(vis));
+                    else if (tick == 8 && !vis) ui.post(() -> startServer(true));
+                    else if (tick > 8 && tick % 30 == 0) ui.post(() -> startServer(vis));
+                    tick++;
+                }
                 if (up) tick = 0;
                 if (up && !connected) {
                     connected = true;
+                    SharedPreferences.Editor ed = prefs.edit().putBoolean("ready", true);
+                    if (lastVisible) ed.putBoolean("visible", true);
+                    ed.apply();
                     ui.post(() -> web.loadUrl(APP_URL));
                 } else if (!up && connected) {
                     connected = false;
@@ -346,6 +377,10 @@ public class MainActivity extends Activity {
             });
         }
         @JavascriptInterface public void showDashboard() { ui.post(() -> showTab(true)); }
-        @JavascriptInterface public void start() { ui.post(MainActivity.this::startServer); }
+        @JavascriptInterface public void start() { ui.post(() -> startServer()); }
+        @JavascriptInterface public void startMode(boolean visible) { ui.post(() -> startServer(visible)); }
+        @JavascriptInterface public boolean isReady() { return prefs.getBoolean("ready", false); }
+        @JavascriptInterface public String lastError() { return ResultReceiver.last; }
+        @JavascriptInterface public void resetSetup() { prefs.edit().clear().apply(); ResultReceiver.last = ""; }
     }
 }
